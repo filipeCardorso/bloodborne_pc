@@ -29,3 +29,5 @@ patches.json
 # IDE/session-local
 .claude/
 .vscode/
+.deps-macos/
+out-deps.log

@@ -13,8 +13,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import struct
+import subprocess
+import sys
 import tempfile
 from prepare import nid
 
@@ -198,6 +201,19 @@ def _cpuid_windows():
 def missing_host_extensions(cpuid=None):
     """Names of HOST_EXTENSIONS this CPU lacks, or None when CPUID cannot be read here."""
     cleanup = None
+    if cpuid is None and sys.platform == 'darwin':
+        # Rosetta 2 runs BMI1, LZCNT and MOVBE (its CPUID hides them); Intel Macs report theirs.
+        try:
+            translated = subprocess.run(['sysctl', '-n', 'sysctl.proc_translated'], capture_output=True,
+                                        text=True).stdout.strip() == '1'
+            if translated or platform.machine() == 'arm64':
+                return []
+            flags = subprocess.run(['sysctl', '-n', 'machdep.cpu.features', 'machdep.cpu.leaf7_features',
+                                    'machdep.cpu.extfeatures'], capture_output=True, text=True).stdout.split()
+            names = {'BMI1': 'BMI1', 'LZCNT': 'LZCNT', 'MOVBE': 'MOVBE'}
+            return [name for name in HOST_EXTENSIONS if names[name] not in flags]
+        except OSError:
+            return None
     if cpuid is None and os.name != 'nt':
         # The kernel's CPUID flags (LZCNT is "abm"); without them every CPU counted as unknown
         # and got the translations.

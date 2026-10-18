@@ -5,6 +5,10 @@ mkdir -p out
 # Windows: MSYS2 CLANG64 (packages in packaging/windows/README.md). The GPU library is static
 # there and CMake links bb-probe.exe as well; no PGO (GCC-only flags), LTO off by default.
 case $(uname -s) in
+Darwin)
+    # macOS: x86-64 build (Rosetta 2 on Apple Silicon) against packaging/macos/build_deps.sh.
+    exec bash packaging/macos/build.sh "$@"
+    ;;
 MINGW*|MSYS*)
     # shellcheck source=msys2-env.sh
     source ./msys2-env.sh

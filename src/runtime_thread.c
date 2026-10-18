@@ -18,9 +18,11 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include <sys/syscall.h>
 #include <sys/mman.h>
+#ifndef __APPLE__
+#include <sys/syscall.h>
 #include <asm/prctl.h>
+#endif
 #endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define ATTR_MAGIC UINT32_C(0x41545452)
@@ -82,6 +84,26 @@ static void set_gs(void *base) {
     if (!TlsSetValue(tls_slot,base)) { fprintf(stderr,"STOP: TlsSetValue failed (%lu)\n",GetLastError()); exit(21); }
 }
 #define tls_block_alloc(size) _aligned_malloc(size,64)
+#elif defined(__APPLE__)
+/* macOS: GS points at the thread's pthread TSD slots (Rosetta 2 keeps that layout), so like on
+ * Windows the guest TCB lives in a slot: gs:[8*key] is pthread_getspecific(key). */
+static pthread_key_t tls_key;
+static pthread_once_t tls_key_once=PTHREAD_ONCE_INIT;
+static void tls_key_create(void) {
+    if (pthread_key_create(&tls_key,NULL)) { fputs("STOP: pthread_key_create failed\n",stderr); exit(21); }
+}
+uint32_t runtime_thread_tcb_offset(void) {
+    pthread_once(&tls_key_once,tls_key_create);
+    return 8*(uint32_t)tls_key;
+}
+static void set_gs(void *base) {
+    runtime_thread_tcb_offset();
+    if (pthread_setspecific(tls_key,base)) { fputs("STOP: pthread_setspecific failed\n",stderr); exit(21); }
+    void *check;
+    __asm__ volatile("mov %%gs:(%1),%0" : "=r"(check) : "r"((uintptr_t)8*tls_key));
+    if (check!=base) { fprintf(stderr,"STOP: gs:[0x%x] does not hold the guest TCB\n",8*(unsigned)tls_key); exit(21); }
+}
+#define tls_block_alloc(size) aligned_alloc(64,size)
 #else
 static void set_gs(void *base) {
     if (syscall(SYS_arch_prctl,ARCH_SET_GS,(unsigned long)base)) { perror("STOP: arch_prctl(ARCH_SET_GS)"); exit(21); }

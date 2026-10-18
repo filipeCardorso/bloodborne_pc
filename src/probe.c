@@ -15,15 +15,28 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
-#include <malloc.h>
 #include <unistd.h>
 #include <signal.h>
-#include <ucontext.h>
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <execinfo.h>
+#ifdef __APPLE__
+#include <sys/ucontext.h>
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#define CONTEXT_RIP(uc) ((uc)->uc_mcontext->__ss.__rip)
+#define CONTEXT_RBP(uc) ((uc)->uc_mcontext->__ss.__rbp)
+#define CONTEXT_RDI(uc) ((uc)->uc_mcontext->__ss.__rdi)
+#undef round_page /* <mach/vm_param.h> */
+#else
+#include <malloc.h>
+#include <ucontext.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#define CONTEXT_RIP(uc) ((uc)->uc_mcontext.gregs[REG_RIP])
+#define CONTEXT_RBP(uc) ((uc)->uc_mcontext.gregs[REG_RBP])
+#define CONTEXT_RDI(uc) ((uc)->uc_mcontext.gregs[REG_RDI])
+#endif
 #endif
 
 typedef struct { uint64_t address, size, flags; } Segment;
@@ -92,7 +105,12 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
 #ifndef _WIN32
 /* enter_on_stack(entry, arg0, arg1, stack_top): call entry(arg0,arg1) on a new stack. */
 void enter_on_stack(void *entry, void *arg0, void *arg1, void *top);
-__asm__(".text\n.globl enter_on_stack\nenter_on_stack:\n"
+#ifdef __APPLE__
+#define ASM_NAME(name) "_" #name /* Mach-O C symbols carry a leading underscore */
+#else
+#define ASM_NAME(name) #name
+#endif
+__asm__(".text\n.globl " ASM_NAME(enter_on_stack) "\n" ASM_NAME(enter_on_stack) ":\n"
         " push %rbp\n mov %rsp,%rbp\n and $-16,%rcx\n mov %rcx,%rsp\n"
         " mov %rdi,%rax\n mov %rsi,%rdi\n mov %rdx,%rsi\n call *%rax\n"
         " mov %rbp,%rsp\n pop %rbp\n ret\n");
@@ -107,6 +125,16 @@ static ABI void guest_exit(void) { puts("Runtime: process finalizer callback rea
  * linked image, so only the others stop the game then. */
 static void check_cpu(void) {
     if (getenv("BB_SKIP_CPU_CHECK")) return;
+#ifdef __APPLE__
+    /* Rosetta 2 runs AVX, AVX2, BMI1, LZCNT, MOVBE, FMA and F16C but its CPUID reports none of
+     * them (macOS 15+); a native Intel Mac with AVX passes the check below. */
+    int translated_mac=0;
+    size_t size=sizeof(translated_mac);
+    if (!sysctlbyname("sysctl.proc_translated",&translated_mac,&size,NULL,0) && translated_mac) {
+        puts("CPU: Rosetta 2 (x86-64 translation); the PS4 instruction set extensions run translated");
+        return;
+    }
+#endif
     const int translated=getenv("BB_CPU_COMPAT")!=NULL;
     unsigned a=0, b=0, c=0, d=0, basic=0, leaf7=0, extended=0;
     if (__get_cpuid(1,&a,&b,&c,&d)) basic=c;
@@ -228,8 +256,11 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 static LONG WINAPI unhandled_fault(EXCEPTION_POINTERS *info) { return fatal_exception(info); }
+#endif
+#if defined(_WIN32) || defined(__APPLE__)
 /* Guest code reads its TCB with `mov rax, gs:[0]` (link_*.py rewrote fs:[0]); on Windows
- * the displacement becomes the TEB TLS slot that holds the guest TCB (runtime_thread.c). */
+ * the displacement becomes the TEB TLS slot that holds the guest TCB, on macOS the pthread TSD
+ * slot (runtime_thread.c). */
 uint32_t runtime_thread_tcb_offset(void);
 static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
     static const unsigned char load[]={0x65,0x48,0x8b,0x04,0x25,0,0,0,0};
@@ -260,7 +291,7 @@ static void fault(int sig, siginfo_t *info, void *context) {
     }
     /* The process is terminating: dladdr/snprintf are acceptable here. */
     ucontext_t *uc = context;
-    uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+    uintptr_t rip = (uintptr_t)CONTEXT_RIP(uc);
     char line[512];
     Dl_info where;
     if (rip - (uintptr_t)image < 0x10000000)
@@ -297,18 +328,24 @@ static void write_hex(char *out, uint64_t v) {
 }
 static void dump_frames(ucontext_t *uc) {
     char line[] = "  tid=0000000000000000 rip=0000000000000000 image-relative=0000000000000000 host-relative=0000000000000000\n";
-    uintptr_t rip=(uintptr_t)uc->uc_mcontext.gregs[REG_RIP], rbp=(uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
+    uintptr_t rip=(uintptr_t)CONTEXT_RIP(uc), rbp=(uintptr_t)CONTEXT_RBP(uc);
     uint64_t tid=(uint64_t)gettid();
     /* First argument register: the lock address when a thread waits on a futex. */
     char arg[]="  tid=0000000000000000 rdi=0000000000000000\n";
-    write_hex(arg+6,tid); write_hex(arg+27,(uint64_t)uc->uc_mcontext.gregs[REG_RDI]);
+    write_hex(arg+6,tid); write_hex(arg+27,(uint64_t)CONTEXT_RDI(uc));
     { ssize_t written_=write(2,arg,sizeof(arg)-1); (void)written_; }
     for (int depth=0; depth<24; ++depth) {
         write_hex(line+6,tid); write_hex(line+27,rip); write_hex(line+59,rip-(uintptr_t)image); write_hex(line+90,rip-exe_base);
         { ssize_t written_=write(2,line,sizeof(line)-1); (void)written_; }
         uintptr_t frame[2];
+#ifdef __APPLE__
+        vm_size_t got=0;
+        if (!rbp || vm_read_overwrite(mach_task_self(),(vm_address_t)rbp,sizeof(frame),(vm_address_t)frame,&got)!=KERN_SUCCESS ||
+            got!=sizeof(frame)) break;
+#else
         struct iovec local={frame,sizeof(frame)}, remote={(void *)rbp,sizeof(frame)};
         if (!rbp || process_vm_readv(getpid(),&local,1,&remote,1,0)!=(ssize_t)sizeof(frame)) break;
+#endif
         if (frame[0]<=rbp) break;
         rbp=frame[0]; rip=frame[1];
     }
@@ -319,6 +356,16 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
     const char head[]="STOP: watchdog timeout; thread stacks:\n";
     { ssize_t written_=write(2,head,sizeof(head)-1); (void)written_; }
     dump_frames(context);
+#ifdef __APPLE__
+    thread_act_array_t list;
+    mach_msg_type_number_t count=0;
+    mach_port_t self=mach_thread_self();
+    if (task_threads(mach_task_self(),&list,&count)==KERN_SUCCESS)
+        for (mach_msg_type_number_t i=0;i<count;++i) {
+            pthread_t thread=list[i]!=self ? pthread_from_mach_thread_np(list[i]) : NULL;
+            if (thread) { pthread_kill(thread,SIGUSR2); usleep(20000); }
+        }
+#else
     int dir=open("/proc/self/task",O_RDONLY|O_DIRECTORY);
     char buffer[4096];
     long n;
@@ -330,6 +377,7 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
             if (tid>0 && tid!=self) { syscall(SYS_tgkill,getpid(),tid,SIGUSR2); usleep(20000); }
             at+=d->reclen;
         }
+#endif
     usleep(100000);
     _exit(128 + sig);
 }
@@ -423,7 +471,11 @@ void runtime_restart(void) {
     TerminateProcess(GetCurrentProcess(),0);
 #else
     puts("Runtime: restarting through run.sh");
+#ifdef __APPLE__
+    bb_close_from(3);
+#else
     syscall(SYS_close_range, 3u, ~0u, 0u);
+#endif
     execlp("bash", "bash", "run.sh", (char *)NULL);
     perror("runtime_restart: exec");
     _exit(1);
@@ -432,7 +484,7 @@ void runtime_restart(void) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
     mallopt(M_ARENA_MAX,1);
@@ -662,6 +714,8 @@ int main(int argc, char **argv) {
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
+#elif defined(__APPLE__)
+    printf("Guest TCB loads redirected to the pthread TSD slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);

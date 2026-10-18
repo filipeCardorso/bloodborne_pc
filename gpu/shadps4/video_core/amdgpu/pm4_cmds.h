@@ -761,7 +761,11 @@ struct PM4CmdWriteData {
 
     template <typename T>
     T Address() const {
-        return reinterpret_cast<T>(addr64);
+        if constexpr (std::is_integral_v<T>) {
+            return static_cast<T>(addr64); // u64 and uintptr_t differ in type on macOS
+        } else {
+            return reinterpret_cast<T>(addr64);
+        }
     }
 };
 
