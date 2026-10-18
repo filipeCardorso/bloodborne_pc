@@ -54,4 +54,5 @@ If it stops, send `run.sh`'s output. Its last lines say where it stopped.
 - Host heap objects handed to the game (thread records, TLS blocks) come from macOS malloc above
   1 TiB. Linux keeps them below 1 TiB with `mallopt`, while Windows does not either.
 - DLSS and FSR 4 are not available. FSR 3.1 and TAA build.
-- No launcher app yet: `run.sh` is the way to start the game.
+- The launcher (GTK 4) runs after `brew install pygobject3 gtk4 libadwaita`:
+  `bash launcher/bb-launcher.sh`. There is no `.app` bundle yet.
